@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 from scipy.optimize import curve_fit
@@ -6,7 +7,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
+import re
+import time
 from datetime import datetime
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import urlopen
 # ─────────────────────────────────────────────────────────────────────────────
 # UNIT CONVERSION CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -470,9 +475,208 @@ def load_csv_production(file) -> dict:
     return wells
 
 
+def _split_google_sheet_urls(sheet_urls: str):
+    """Return one or more Google Sheet URLs from a pasted URL list."""
+    urls = re.findall(r"https?://[^\s,;]+", sheet_urls or "")
+    if urls:
+        return [url.strip() for url in urls if url.strip()]
+    single = (sheet_urls or "").strip()
+    return [single] if single else []
+
+
+def _google_sheet_id_and_gid(sheet_url: str):
+    sheet_url = sheet_url.strip()
+    parsed = urlparse(sheet_url)
+    if "docs.google.com" not in parsed.netloc or "/spreadsheets/" not in parsed.path:
+        raise ValueError("Please enter a valid Google Sheets URL.")
+
+    parts = [p for p in parsed.path.split("/") if p]
+    try:
+        sheet_id = parts[parts.index("d") + 1]
+    except (ValueError, IndexError):
+        raise ValueError("Could not find the spreadsheet ID in that URL.")
+
+    query = parse_qs(parsed.query)
+    gid = query.get("gid", [None])[0]
+    if not gid and "gid=" in parsed.fragment:
+        gid = parse_qs(parsed.fragment).get("gid", [None])[0]
+    return sheet_id, gid
+
+
+def google_sheet_csv_url(sheet_url: str) -> str:
+    """Convert a Google Sheets share URL to a direct CSV export URL."""
+    sheet_url = sheet_url.strip()
+    parsed = urlparse(sheet_url)
+    if "docs.google.com" not in parsed.netloc or "/spreadsheets/" not in parsed.path:
+        raise ValueError("Please enter a valid Google Sheets URL.")
+
+    if "/export" in parsed.path and "format=csv" in parsed.query:
+        return sheet_url
+
+    sheet_id, gid = _google_sheet_id_and_gid(sheet_url)
+
+    export_query = {"format": "csv"}
+    if gid:
+        export_query["gid"] = gid
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?{urlencode(export_query)}"
+
+
+def google_sheet_xlsx_url(sheet_url: str) -> str:
+    """Convert a Google Sheets share URL to a direct XLSX export URL."""
+    sheet_id, _ = _google_sheet_id_and_gid(sheet_url)
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+
+
+def _prefixed_wells(wells: dict, prefix: str, existing=None) -> dict:
+    """Prefix duplicate well names when combining multiple spreadsheet URLs."""
+    existing = existing or {}
+    out = {}
+    for well, df in wells.items():
+        name = well
+        if name in existing or name in out:
+            name = f"{prefix} - {well}"
+        counter = 2
+        base_name = name
+        while name in existing or name in out:
+            name = f"{base_name} ({counter})"
+            counter += 1
+        out[name] = df
+    return out
+
+
+def load_google_sheet_production(sheet_urls: str) -> dict:
+    all_wells = {}
+    urls = _split_google_sheet_urls(sheet_urls)
+    loaded_workbooks = set()
+    if not urls:
+        return {}
+
+    for idx, sheet_url in enumerate(urls, start=1):
+        try:
+            sheet_id, _ = _google_sheet_id_and_gid(sheet_url)
+            if sheet_id in loaded_workbooks:
+                continue
+            wells = {}
+            workbook_url = google_sheet_xlsx_url(sheet_url)
+            with urlopen(workbook_url, timeout=30) as response:
+                workbook = io.BytesIO(response.read())
+            wells = load_excel_production(workbook)
+            if wells:
+                loaded_workbooks.add(sheet_id)
+            if not wells:
+                csv_url = google_sheet_csv_url(sheet_url)
+                wells = load_csv_production(csv_url)
+            all_wells.update(_prefixed_wells(wells, f"Sheet {idx}", all_wells))
+        except Exception as e:
+            try:
+                csv_url = google_sheet_csv_url(sheet_url)
+                wells = load_csv_production(csv_url)
+                all_wells.update(_prefixed_wells(wells, f"Sheet {idx}", all_wells))
+            except Exception:
+                st.error(f"Google Sheets read error for URL {idx}: {e}")
+    return all_wells
+
+
+def _merge_well_frames(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
+    merged = pd.concat([existing, incoming], ignore_index=True)
+    if "Date" in merged.columns:
+        merged = merged.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
+    else:
+        merged = merged.drop_duplicates(keep="last")
+    return merged.reset_index(drop=True)
+
+
+def _combined_wells_signature(wells: dict) -> tuple:
+    signature = []
+    for well, df in sorted(wells.items()):
+        max_date = df["Date"].max() if "Date" in df.columns and len(df) else ""
+        totals = []
+        for col in ["Oil_bbl", "Gas_mscf", "Water_bbl"]:
+            totals.append(round(float(df[col].sum()), 4) if col in df.columns else 0.0)
+        signature.append((well, len(df), str(max_date), *totals))
+    return tuple(signature)
+
+
+def _rebuild_combined_wells() -> None:
+    previous_wells = set(st.session_state.get("wells", {}).keys())
+    previous_selection = list(st.session_state.get("selected", []))
+    combined = {}
+    for source_key in ["local_wells", "google_wells"]:
+        for well, df in st.session_state.get(source_key, {}).items():
+            if well in combined:
+                combined[well] = _merge_well_frames(combined[well], df)
+            else:
+                combined[well] = df.copy()
+
+    old_signature = st.session_state.get("wells_signature")
+    new_signature = _combined_wells_signature(combined)
+    st.session_state.wells = combined
+    combined_names = list(combined.keys())
+    if st.session_state.get("well_filter_initialized", False):
+        kept_selection = [w for w in previous_selection if w in combined]
+        new_wells = [w for w in combined_names if w not in previous_wells]
+        st.session_state.selected = kept_selection + new_wells
+    else:
+        st.session_state.selected = combined_names
+    st.session_state.data_uploaded = bool(combined)
+    if new_signature != old_signature:
+        st.session_state.dca_results = {}
+        st.session_state.eur_results = {}
+        st.session_state.wells_signature = new_signature
+
+
+def _store_loaded_wells(wells: dict, source: str) -> None:
+    if source == "google":
+        st.session_state.google_wells = wells
+    else:
+        st.session_state.local_wells = wells
+    _rebuild_combined_wells()
+
+
+def _sync_google_sheet(sheet_url: str) -> bool:
+    wells = load_google_sheet_production(sheet_url)
+    if wells:
+        _store_loaded_wells(wells, source="google")
+        st.session_state.google_sheet_active_url = sheet_url.strip()
+        st.session_state.google_sheet_last_sync = time.time()
+        return True
+    return False
+
+
+def _google_sheet_sync_timer(interval_ms: int) -> None:
+    components.html(
+        f"""
+        <script>
+        window.setTimeout(function() {{
+            window.parent.postMessage({{
+                isStreamlitMessage: true,
+                type: "streamlit:setComponentValue",
+                value: Date.now()
+            }}, "*");
+        }}, {interval_ms});
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _google_sheet_sync_due(sheet_url: str, refresh_seconds: int) -> bool:
+    active_url = st.session_state.get("google_sheet_active_url", "")
+    last_sync = float(st.session_state.get("google_sheet_last_sync", 0.0))
+    return (
+        sheet_url.strip() != active_url
+        or not st.session_state.wells
+        or (time.time() - last_sync) >= refresh_seconds
+    )
+
+
 def _init_state():
     defaults = dict(
         wells={},
+        local_wells={},
+        google_wells={},
+        wells_signature=(),
+        well_filter_initialized=False,
         selected=[],
         dca_results={},
         eur_results={},
@@ -490,6 +694,9 @@ def _init_state():
         ai_log=[],
         page="Dashboard Overview",
         field_name="Field",
+        google_sheet_active_url="",
+        google_sheet_last_sync=0.0,
+        google_sheet_sync=False,
     )
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -1251,6 +1458,10 @@ def render_sidebar():
 
             **CSV Alternative:**
             - Columns: `date`, `oil`, `gas`, `water`, `well`
+
+            **Google Sheets:**
+            - Paste one spreadsheet URL to load all visible worksheet tabs
+            - Paste multiple worksheet URLs on separate lines to combine them
             """)
 
         uploaded = st.file_uploader(
@@ -1262,12 +1473,10 @@ def render_sidebar():
             with st.spinner("⏳ Loading and validating data…"):
                 try:
                     if uploaded.name.endswith(".csv"):
-                        st.session_state.wells = load_csv_production(uploaded)
+                        wells = load_csv_production(uploaded)
                     else:
-                        st.session_state.wells = load_excel_production(uploaded)
-                    st.session_state.selected = list(st.session_state.wells.keys())[:3]
-                    st.session_state.dca_results = {}
-                    st.session_state.eur_results = {}
+                        wells = load_excel_production(uploaded)
+                    _store_loaded_wells(wells, source="local")
                     if st.session_state.wells:
                         st.session_state.data_uploaded = True
                         st.success(f"✅ {len(st.session_state.wells)} well(s) loaded!")
@@ -1278,19 +1487,80 @@ def render_sidebar():
                     st.session_state.data_uploaded = False
                     st.error(f"❌ Error loading file: {e}")
 
+        st.caption("Or load public Google Sheet worksheet URLs")
+        sheet_url = st.text_area(
+            "Google Sheets URLs",
+            placeholder="Paste one Google Sheets URL, or multiple worksheet URLs on separate lines",
+            label_visibility="collapsed",
+            key="google_sheet_url",
+            height=72,
+        )
+        st.checkbox("Real-Time Sync every 3s", key="google_sheet_sync")
+        if st.button("Load Google Sheet(s)", use_container_width=True, key="load_google_sheet"):
+            if not sheet_url.strip():
+                st.warning("Paste at least one Google Sheets link first.")
+            else:
+                with st.spinner("Loading Google Sheet workbook(s)..."):
+                    if _sync_google_sheet(sheet_url):
+                        st.success(f"{len(st.session_state.wells)} well(s) loaded from Google Sheets!")
+                    else:
+                        st.error("No valid wells found. Make the sheet(s) public or check the data format.")
+        if st.session_state.google_sheet_sync and sheet_url.strip():
+            refresh_seconds = 3
+            interval_ms = refresh_seconds * 1000
+            if _google_sheet_sync_due(sheet_url, refresh_seconds):
+                with st.spinner("Syncing Google Sheet data..."):
+                    _sync_google_sheet(sheet_url)
+            last_sync = float(st.session_state.get("google_sheet_last_sync", 0.0))
+            if last_sync:
+                last_sync_text = datetime.fromtimestamp(last_sync).strftime("%H:%M:%S")
+                st.caption(f"Real-Time Sync on. Last sync: {last_sync_text}")
+            if hasattr(st, "fragment"):
+                @st.fragment(run_every=refresh_seconds)
+                def _google_sheet_sync_fragment():
+                    if _google_sheet_sync_due(sheet_url, refresh_seconds):
+                        if _sync_google_sheet(sheet_url):
+                            st.rerun()
+
+                _google_sheet_sync_fragment()
+            else:
+                _google_sheet_sync_timer(interval_ms)
+        elif st.session_state.google_sheet_sync:
+            st.caption("Real-Time Sync is on. Paste one or more Google Sheets URLs to begin.")
+
         st.session_state.field_name = st.text_input(
             "Field", value=st.session_state.field_name,
         )
-        all_wells = list(st.session_state.wells.keys())
-        if all_wells:
-            st.session_state.selected = st.multiselect(
-                "Wells", options=all_wells,
-                default=st.session_state.selected or all_wells[:3],
+        if st.session_state.wells:
+            all_wells = list(st.session_state.wells.keys())
+            st.session_state.well_filter_initialized = True
+            st.markdown("**Wells to Include**")
+            filter_col1, filter_col2 = st.columns(2)
+            with filter_col1:
+                if st.button("Select All", use_container_width=True, key="select_all_wells"):
+                    st.session_state.selected = all_wells
+                    st.rerun()
+            with filter_col2:
+                if st.button("Clear", use_container_width=True, key="clear_selected_wells"):
+                    st.session_state.selected = []
+                    st.rerun()
+            st.session_state.selected = [w for w in st.session_state.selected if w in all_wells]
+            st.multiselect(
+                "Choose wells",
+                options=all_wells,
+                key="selected",
+                placeholder="Select wells to include in analysis",
             )
+            st.caption(f"Using {len(st.session_state.selected)} of {len(all_wells)} loaded wells")
 
         if st.session_state.wells:
             with st.expander("📦 Loaded Wells", expanded=False):
-                st.markdown(f"**{len(st.session_state.wells)} well(s) loaded**")
+                local_count = len(st.session_state.get("local_wells", {}))
+                google_count = len(st.session_state.get("google_wells", {}))
+                st.markdown(
+                    f"**{len(st.session_state.wells)} well(s) loaded** "
+                    f"({local_count} local, {google_count} Google Sheet)"
+                )
                 for well, df in st.session_state.wells.items():
                     if "Date" in df.columns and not df["Date"].empty:
                         date_range = f"({df['Date'].min().date()} → {df['Date'].max().date()})"

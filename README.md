@@ -6,8 +6,9 @@ PetroDCA is a Streamlit application for petroleum production analysis, decline c
 
 - `app.py` - Main Streamlit application.
 - `requirements.txt` - Python dependencies required to run the app.
-- `.venv/` - Local virtual environment created for this project.
-- `AI_INTERACTION_LOG.md` - Record of how AI support was used during setup, debugging, and architecture documentation.
+- `AI_INTERACTION_LOG.md` - Record of how AI support was used during setup, debugging, and feature updates.
+- `Field Data/` - Optional local production data files.
+- `.venv/` - Local virtual environment for this project.
 
 ## Setup
 
@@ -17,9 +18,7 @@ From the `kwame2` folder:
 .\.venv\Scripts\activate
 ```
 
-The environment has already been created with Python 3.14.4 and dependencies installed from `requirements.txt`.
-
-To reinstall dependencies later:
+To install or refresh dependencies with `uv`:
 
 ```powershell
 uv pip install -r requirements.txt
@@ -39,9 +38,32 @@ streamlit run app.py
 
 Then open the local Streamlit URL shown in the terminal.
 
+## Data Sources
+
+PetroDCA can load production data from:
+
+- Local Excel files (`.xlsx`, `.xls`) with one worksheet per well.
+- Local CSV files with columns such as `date`, `oil`, `gas`, `water`, and optionally `well`.
+- Public Google Sheets URLs.
+
+For Google Sheets:
+
+- Paste one spreadsheet URL to load all visible worksheet tabs.
+- Paste multiple Google Sheets URLs on separate lines to combine them.
+- Enable **Real-Time Sync every 3s** to refresh Google Sheet data automatically.
+- Local uploads and Google Sheet data are kept as separate sources internally, then merged into one combined dataset for analysis.
+- If the same well exists in local and Google Sheet data, rows are merged by date, with synced Google Sheet rows taking precedence on duplicate dates.
+
+## Well Selection
+
+After loading data, use **Wells to Include** in the sidebar to choose which wells are included in dashboards, DCA, EUR forecasting, insights, and reports.
+
+The filter is non-destructive: hidden wells remain loaded and can be reselected later. New wells introduced by a later upload or Google Sheet sync are automatically included.
+
 ## Main Features
 
-- Upload and parse production data from CSV or Excel files.
+- Upload and parse production data from CSV, Excel, or public Google Sheets.
+- Cross-examine multiple worksheets and multiple well sources in one combined analysis.
 - Convert oil, gas, and water production rates into field units.
 - Fit Arps decline models using SciPy.
 - Compare exponential, harmonic, and hyperbolic decline behavior.
@@ -63,3 +85,4 @@ Core packages include:
 - xlsxwriter
 - xlrd
 
+Standard-library modules are also used for Google Sheets URL parsing and workbook downloads.
