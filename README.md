@@ -53,6 +53,8 @@ For Google Sheets:
 - Enable **Real-Time Sync every 3s** to refresh Google Sheet data automatically.
 - Local uploads and Google Sheet data are kept as separate sources internally, then merged into one combined dataset for analysis.
 - If the same well exists in local and Google Sheet data, rows are merged by date, with synced Google Sheet rows taking precedence on duplicate dates.
+A Google-sheet link to use for illustration is given below;
+[Google_sheet link](https://docs.google.com/spreadsheets/d/16owoXpOY7s2koGbrdhdtAqSwoANYk2l4FBID-t6XPJ8/edit?gid=1854687645#gid=1854687645) 
 
 ## Well Selection
 
